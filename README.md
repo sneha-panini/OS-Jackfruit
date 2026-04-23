@@ -2,8 +2,8 @@
 
 ## 1. Team Information
 
-* Name:
-* SRN:
+* Name:sneha panini
+* SRN:PES2UG24CS502
 * 
 
 
