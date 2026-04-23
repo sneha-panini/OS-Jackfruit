@@ -48,7 +48,7 @@ The system consists of:
 
 ## 4. Setup Instructions
 
-### 🔧 Install dependencies
+###  Install dependencies
 
 ```bash
 sudo apt update
@@ -57,7 +57,7 @@ sudo apt install -y build-essential linux-headers-$(uname -r)
 
 ---
 
-### 📦 Prepare root filesystem
+###  Prepare root filesystem
 
 ```bash
 mkdir rootfs-base
@@ -70,7 +70,7 @@ cp -a rootfs-base rootfs-beta
 
 ---
 
-### 🔨 Build project
+### Build project
 
 ```bash
 make clean
@@ -79,7 +79,7 @@ make
 
 ---
 
-### 🔌 Load kernel module
+###  Load kernel module
 
 ```bash
 sudo insmod monitor.ko
@@ -88,7 +88,7 @@ ls -l /dev/container_monitor
 
 ---
 
-### 🚀 Start supervisor
+###  Start supervisor
 
 ```bash
 sudo ./engine supervisor ./rootfs-base
@@ -98,7 +98,7 @@ sudo ./engine supervisor ./rootfs-base
 
 ## 5. Running Containers
 
-### ▶️ Start container
+###  Start container
 
 ```bash
 sudo ./engine start alpha ./rootfs-alpha /bin/sh
@@ -106,7 +106,7 @@ sudo ./engine start alpha ./rootfs-alpha /bin/sh
 
 ---
 
-### ▶️ Run foreground container
+###  Run foreground container
 
 ```bash
 sudo ./engine run beta ./rootfs-beta /bin/sh
@@ -114,7 +114,7 @@ sudo ./engine run beta ./rootfs-beta /bin/sh
 
 ---
 
-### 📊 List containers
+###  List containers
 
 ```bash
 sudo ./engine ps
@@ -122,7 +122,7 @@ sudo ./engine ps
 
 ---
 
-### 📜 View logs
+###  View logs
 
 ```bash
 sudo ./engine logs alpha
@@ -130,7 +130,7 @@ sudo ./engine logs alpha
 
 ---
 
-### 🛑 Stop container
+###  Stop container
 
 ```bash
 sudo ./engine stop alpha
