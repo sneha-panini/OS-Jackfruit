@@ -40,6 +40,14 @@
  *   - include `struct list_head` linkage
  * ============================================================== */
 
+struct monitored_entry {
+    pid_t          pid;
+    char           container_id[MONITOR_NAME_LEN];
+    unsigned long  soft_limit_bytes;
+    unsigned long  hard_limit_bytes;
+    int            soft_warned;   /* set to 1 after the first soft-limit warning */
+    struct list_head list;
+};
 
 /* ==============================================================
  * TODO 2: Declare the global monitored list and a lock.
@@ -48,10 +56,18 @@
  *   - shared across ioctl and timer code paths
  *   - protect insert, remove, and iteration safely
  *
- * You may choose either a mutex or a spinlock, but your README must
- * justify the choice in terms of the code paths you implemented.
+ * Design choice – mutex rather than spinlock:
+ *   Both the ioctl handler and the timer callback run in process
+ *   (or softirq-deferred work) context on kernels >= 4.15 where
+ *   timer_setup() uses a timer-softirq workqueue rather than a
+ *   hard-IRQ handler.  A mutex is therefore safe for both paths
+ *   and does not require disabling interrupts.  If the list ever
+ *   needed to be touched from a hard-IRQ context, a spinlock with
+ *   irqsave/irqrestore would be required instead.
  * ============================================================== */
 
+static LIST_HEAD(monitored_list);
+static DEFINE_MUTEX(monitored_lock);
 
 /* --- Provided: internal device / timer state --- */
 static struct timer_list monitor_timer;
@@ -144,6 +160,45 @@ static void timer_callback(struct timer_list *t)
      *   - avoid use-after-free while deleting during iteration
      * ============================================================== */
 
+    struct monitored_entry *entry, *tmp;
+
+    mutex_lock(&monitored_lock);
+
+    list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+        long rss = get_rss_bytes(entry->pid);
+
+        /* Process has exited — remove and free the entry */
+        if (rss < 0) {
+            printk(KERN_INFO
+                   "[container_monitor] Process exited container=%s pid=%d, removing.\n",
+                   entry->container_id, entry->pid);
+            list_del(&entry->list);
+            kfree(entry);
+            continue;
+        }
+
+        /* Hard limit exceeded: kill the process and remove the entry */
+        if (entry->hard_limit_bytes > 0 &&
+            (unsigned long)rss > entry->hard_limit_bytes) {
+            kill_process(entry->container_id, entry->pid,
+                         entry->hard_limit_bytes, rss);
+            list_del(&entry->list);
+            kfree(entry);
+            continue;
+        }
+
+        /* Soft limit exceeded: warn once, then remember we warned */
+        if (!entry->soft_warned &&
+            entry->soft_limit_bytes > 0 &&
+            (unsigned long)rss > entry->soft_limit_bytes) {
+            log_soft_limit_event(entry->container_id, entry->pid,
+                                 entry->soft_limit_bytes, rss);
+            entry->soft_warned = 1;
+        }
+    }
+
+    mutex_unlock(&monitored_lock);
+
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 }
 
@@ -167,6 +222,8 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         return -EFAULT;
 
     if (cmd == MONITOR_REGISTER) {
+        struct monitored_entry *entry;
+
         printk(KERN_INFO
                "[container_monitor] Registering container=%s pid=%d soft=%lu hard=%lu\n",
                req.container_id, req.pid, req.soft_limit_bytes, req.hard_limit_bytes);
@@ -180,9 +237,36 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
          *   - insert into the shared list under the chosen lock
          * ============================================================== */
 
+        /* Validate: soft limit must not exceed hard limit when both are set */
+        if (req.hard_limit_bytes > 0 &&
+            req.soft_limit_bytes > req.hard_limit_bytes) {
+            printk(KERN_WARNING
+                   "[container_monitor] Invalid limits: soft=%lu > hard=%lu\n",
+                   req.soft_limit_bytes, req.hard_limit_bytes);
+            return -EINVAL;
+        }
+
+        entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+        if (!entry)
+            return -ENOMEM;
+
+        entry->pid              = req.pid;
+        entry->soft_limit_bytes = req.soft_limit_bytes;
+        entry->hard_limit_bytes = req.hard_limit_bytes;
+        entry->soft_warned      = 0;
+        strncpy(entry->container_id, req.container_id,
+                sizeof(entry->container_id) - 1);
+        entry->container_id[sizeof(entry->container_id) - 1] = '\0';
+        INIT_LIST_HEAD(&entry->list);
+
+        mutex_lock(&monitored_lock);
+        list_add_tail(&entry->list, &monitored_list);
+        mutex_unlock(&monitored_lock);
+
         return 0;
     }
 
+    /* MONITOR_UNREGISTER path */
     printk(KERN_INFO
            "[container_monitor] Unregister request container=%s pid=%d\n",
            req.container_id, req.pid);
@@ -196,7 +280,34 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
      *   - return status indicating whether a matching entry was removed
      * ============================================================== */
 
-    return -ENOENT;
+    {
+        struct monitored_entry *entry, *tmp;
+        int found = 0;
+
+        mutex_lock(&monitored_lock);
+
+        list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+            if (entry->pid == req.pid &&
+                strncmp(entry->container_id, req.container_id,
+                        sizeof(entry->container_id)) == 0) {
+                list_del(&entry->list);
+                kfree(entry);
+                found = 1;
+                break;
+            }
+        }
+
+        mutex_unlock(&monitored_lock);
+
+        if (!found) {
+            printk(KERN_WARNING
+                   "[container_monitor] Unregister: no entry for container=%s pid=%d\n",
+                   req.container_id, req.pid);
+            return -ENOENT;
+        }
+
+        return 0;
+    }
 }
 
 /* --- Provided: file operations --- */
@@ -254,6 +365,19 @@ static void __exit monitor_exit(void)
      *   - remove and free every list node safely
      *   - leave no leaked state on module unload
      * ============================================================== */
+
+    {
+        struct monitored_entry *entry, *tmp;
+
+        mutex_lock(&monitored_lock);
+
+        list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+            list_del(&entry->list);
+            kfree(entry);
+        }
+
+        mutex_unlock(&monitored_lock);
+    }
 
     cdev_del(&c_dev);
     device_destroy(cl, dev_num);
